@@ -1,0 +1,3 @@
+python-libsbml
+sqlalchemy
+git+https://github.com/KarrLab/wc_utils.git#egg=wc_utils
