@@ -1,5 +1,5 @@
 # paper_2018_curr_opin_biotechnol
-This repository provides the code used to generate the figures and tables in the Karr Lab's 2018 review in *Current Opinion in Biotechnology*. 
+This repository provides the code used to generate the figures and tables in the Karr Lab's 2018 whole-cell modeling review in *Current Opinion in Biotechnology*. 
 
 The code performs the following functions:
 * Downloads the [BioModels](http://www.ebi.ac.uk/biomodels-main) database (Release 30)
