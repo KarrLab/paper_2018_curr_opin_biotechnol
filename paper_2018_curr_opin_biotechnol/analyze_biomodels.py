@@ -6,6 +6,7 @@
 :License: MIT
 """
 
+import ete3
 import glob
 import libsbml
 import os
@@ -13,6 +14,7 @@ import sqlalchemy
 import sqlalchemy.ext.declarative
 import sqlalchemy.orm
 import subprocess
+import wc_utils.util.list
 import wc_utils.workbook.core
 import wc_utils.workbook.io
 
@@ -23,6 +25,7 @@ SBML_FILES_ARCHIVE_FILENAME = os.path.join(DATA_DIRNAME, 'sbml_files.tar.bz2')
 SBML_FILES_DIRNAME = os.path.join(DATA_DIRNAME, 'sbml_files')
 SBML_FILES_DATABASE_FILENAME = os.path.join(DATA_DIRNAME, 'sbml_files.sqlite')
 ANNOTATIONS_EXCEL_FILENAME = os.path.join(DATA_DIRNAME, 'models.xlsx')
+SUMMARY_EXCEL_FILENAME = os.path.join(DATA_DIRNAME, 'summary.xlsx')
 
 
 def create_data_directory():
@@ -298,25 +301,162 @@ def export_annotations_to_excel():
     session = get_database_session()
 
     wb = wc_utils.workbook.core.Workbook()
-    ws_mod = wb['Models'] = wc_utils.workbook.core.Worksheet()
-    ws_ann = wb['Annotations'] = wc_utils.workbook.core.Worksheet()
+    ws_models = wb['Models'] = wc_utils.workbook.core.Worksheet()
+    ws_model_annotations = wb['Model annotations'] = wc_utils.workbook.core.Worksheet()
+    ws_annotations = wb['Annotations'] = wc_utils.workbook.core.Worksheet()
 
-    ws_mod.append(wc_utils.workbook.core.Row([
+    style = wc_utils.workbook.io.WorkbookStyle()
+    style['Models'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1,
+        head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    style['Model annotations'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1,
+        head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    style['Annotations'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1,
+        head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+
+    ws_models.append(wc_utils.workbook.core.Row([
         'ID', 'Label', 'Name', 'Type',
         'Compartments', 'Species', 'Rules', 'Reactions', 'Global parameters', 'Reaction parameters',
         'Is curated', 'Number annotations']))
-    ws_ann.append(wc_utils.workbook.core.Row(['Model', 'Relationship', 'Namespace', 'ID']))
+    ws_model_annotations.append(wc_utils.workbook.core.Row(['Model', 'Relationship', 'Namespace', 'ID']))
+    ws_annotations.append(wc_utils.workbook.core.Row(['Relationship', 'Namespace', 'Frequency']))
 
-    for model in session.query(Model).all():
-        ws_mod.append(wc_utils.workbook.core.Row([
+    for model in session.query(Model).order_by(Model.id).all():
+        ws_models.append(wc_utils.workbook.core.Row([
             model.id, model.label, model.name, model.type,
-            model.compartments, model.species, model.rules, model.reactions, model.global_parameters, model.reaction_parameters,
+            model.compartments or None, model.species or None, model.rules or None, model.reactions or None,
+            model.global_parameters or None, model.reaction_parameters or None,
             model.curated, len(model.annotations)
         ]))
-        for annotation in model.annotations:
-            ws_ann.append(wc_utils.workbook.core.Row([model.id, annotation.relationship, annotation.namespace, annotation.id]))
+        for annotation in sorted(model.annotations, key=lambda ann: (ann.relationship, ann.namespace, ann.id)):
+            ws_model_annotations.append(wc_utils.workbook.core.Row(
+                [model.id, annotation.relationship, annotation.namespace, annotation.id]))
 
-    wc_utils.workbook.io.ExcelWriter(ANNOTATIONS_EXCEL_FILENAME).run(wb)
+    q = session \
+        .query(Annotation.relationship, Annotation.namespace, sqlalchemy.func.count(Model._id)) \
+        .join(Model, Annotation.models) \
+        .group_by(Annotation.relationship, Annotation.namespace) \
+        .order_by(sqlalchemy.func.count(Model._id).desc())
+    for relationship, namespace, count in q.all():
+        ws_annotations.append(wc_utils.workbook.core.Row([relationship, namespace, count]))
+
+    wc_utils.workbook.io.ExcelWriter(ANNOTATIONS_EXCEL_FILENAME).run(wb, style=style)
+
+
+def summarize_models():
+    wb = wc_utils.workbook.core.Workbook()
+    style = wc_utils.workbook.io.WorkbookStyle()
+
+    ws_species = wb['Species'] = wc_utils.workbook.core.Worksheet()
+    ws_phyla = wb['Phyla'] = wc_utils.workbook.core.Worksheet()
+    style['Species'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    style['Phyla'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    summarize_models_by_taxonomy(ws_species, ws_phyla)
+
+    ws = wb['Pathways'] = wc_utils.workbook.core.Worksheet()
+    style['Pathways'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    summarize_models_by_pathway(ws)
+
+    ws = wb['Mathematical types'] = wc_utils.workbook.core.Worksheet()
+    style['Mathematical types'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    summarize_models_by_mathematical_type(ws)
+
+    wc_utils.workbook.io.ExcelWriter(SUMMARY_EXCEL_FILENAME).run(wb, style=style)
+
+
+def summarize_models_by_taxonomy(ws_species, ws_phyla):
+    """
+    Args:
+        wc_utils.workbook.core.Worksheet
+    """
+    session = get_database_session()
+    q = session.query(Annotation.id, Model.curated, sqlalchemy.func.count(Model._id)) \
+        .join(Model, Annotation.models) \
+        .filter(Annotation.namespace == 'taxonomy') \
+        .group_by(Annotation.id, Model.curated)
+
+    ncbi_taxa = ete3.NCBITaxa()
+
+    species = {}
+    phyla = {}
+    for model_taxon_id, model_curated, count in q.all():
+        model_taxon_id = int(float(model_taxon_id))
+        species_name = None
+        phylum_name = None
+        for taxon_id, rank in ncbi_taxa.get_rank(ncbi_taxa.get_lineage(model_taxon_id)).items():
+            if rank == 'species':
+                species_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+            if rank == 'phylum':
+                phylum_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+            if rank == 'superkingdom':
+                superkingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+
+        if (superkingdom_name, phylum_name, species_name) not in species:
+            species[(superkingdom_name, phylum_name, species_name)] = {True: 0, False: 0}
+        species[(superkingdom_name, phylum_name, species_name)][model_curated] += count
+
+        if (superkingdom_name, phylum_name) not in phyla:
+            phyla[(superkingdom_name, phylum_name)] = {True: 0, False: 0}
+        phyla[(superkingdom_name, phylum_name)][model_curated] += count
+
+    for (superkingdom_name, phylum_name, species_name), counts in species.items():
+        ws_species.append(wc_utils.workbook.core.Row([
+            species_name or 'Unknown',
+            phylum_name,
+            superkingdom_name,
+            counts[True] or None,
+            counts[False] or None]))
+    ws_species.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
+    ws_species.insert(0, wc_utils.workbook.core.Row(['Species', 'Phylum', 'Superkingdom', 'Curated', 'Non-curated']))
+
+    for (superkingdom_name, phylum_name), counts in phyla.items():
+        ws_phyla.append(wc_utils.workbook.core.Row([
+            superkingdom_name,
+            phylum_name or 'Unknown',
+            counts[True] or None,
+            counts[False] or None]))
+    ws_phyla.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
+    ws_phyla.insert(0, wc_utils.workbook.core.Row(['Superkingdom', 'Phylum', 'Curated', 'Non-curated']))
+
+
+def summarize_models_by_pathway(ws):
+    """
+    Args:
+        wc_utils.workbook.core.Worksheet
+    """
+    session = get_database_session()
+    pass
+
+
+def summarize_models_by_mathematical_type(ws):
+    """
+    Args:
+        wc_utils.workbook.core.Worksheet
+    """
+    session = get_database_session()
+
+    q = session.query(Model.type, Model.curated, sqlalchemy.func.count(Model._id)) \
+        .group_by(Model.type, Model.curated) \
+        .order_by(Model.type)
+    data = {}
+    for type, curated, count in q.all():
+        if type not in data:
+            data[type] = {}
+        data[type][curated] = count
+
+    ws.append(wc_utils.workbook.core.Row(['Type', 'Curated', 'Non-curated']))
+    for type in data.keys():
+        ws.append(wc_utils.workbook.core.Row([
+            type[0].upper() + type[1:] if type else 'Unknown',
+            data[type][True] if True in data[type] else None,
+            data[type][False] if False in data[type] else None,
+        ]))
 
 Base = sqlalchemy.ext.declarative.declarative_base()
 # :obj:`Base`: base model for local sqlite database
@@ -361,4 +501,5 @@ if __name__ == "__main__":
     download_biomodels()
     setup_database()
     load_database()
-    export_annotations_to_excel()
+    # export_annotations_to_excel()
+    summarize_models()
