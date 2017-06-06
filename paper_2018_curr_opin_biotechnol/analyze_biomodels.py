@@ -6,8 +6,10 @@
 :License: MIT
 """
 
+import bioservices
 import ete3
 import glob
+import kinetic_datanator.data_source.bio_portal
 import libsbml
 import os
 import sqlalchemy
@@ -126,6 +128,8 @@ def load_model_into_database(filename, curated, sbml_reader, session):
     id, _, _ = os.path.basename(filename).partition('.xml')
     label = sbml_model.getId()
     name = sbml_model.getName()
+    annotations = parse_model_annotations(sbml_model, session)
+    type = parse_model_type(doc, annotations)
 
     num_reaction_parameters = 0
     reactions_sbml = sbml_model.getListOfReactions()
@@ -139,7 +143,7 @@ def load_model_into_database(filename, curated, sbml_reader, session):
     model = get_or_create_object(session, Model, id=id)
     model.label = label
     model.name = name
-    model.type = parse_model_type(doc)
+    model.type = type
     model.compartments = sbml_model.getNumCompartments()
     model.species = sbml_model.getNumSpecies()
     model.rules = sbml_model.getNumRules()
@@ -147,17 +151,18 @@ def load_model_into_database(filename, curated, sbml_reader, session):
     model.global_parameters = sbml_model.getNumParameters()
     model.reaction_parameters = num_reaction_parameters
     model.curated = curated
-    model.annotations.extend(parse_model_annotations(sbml_model, session))
+    model.annotations.extend(annotations)
 
     session.add(model)
 
     return model
 
 
-def parse_model_type(doc):
+def parse_model_type(doc, annotations):
     """
     Args:
         doc (:obj:`libsbml.SBMLDocument`): SBML document
+        annotations (:obj:`list`: of :obj:`Annotation`): list of annotations
 
     Returns:
         :obj:`str`: model type
@@ -173,6 +178,10 @@ def parse_model_type(doc):
 
     if doc.getPackageRequired('multi'):
         return 'rule-based'
+
+    for annotation in annotations:
+        if annotation.namespace == 'mamo' and annotation.id == 'MAMO_0000046':
+            return 'ordinary differential equation'
 
     if doc.getPackageRequired('fbc'):
         return 'flux balance analysis'
@@ -298,12 +307,16 @@ def model_to_str(model):
 
 
 def export_annotations_to_excel():
+    if os.path.isfile(ANNOTATIONS_EXCEL_FILENAME):
+        return
+
     session = get_database_session()
 
     wb = wc_utils.workbook.core.Workbook()
     ws_models = wb['Models'] = wc_utils.workbook.core.Worksheet()
     ws_model_annotations = wb['Model annotations'] = wc_utils.workbook.core.Worksheet()
     ws_annotations = wb['Annotations'] = wc_utils.workbook.core.Worksheet()
+    ws_namespaces = wb['Namespaces'] = wc_utils.workbook.core.Worksheet()
 
     style = wc_utils.workbook.io.WorkbookStyle()
     style['Models'] = wc_utils.workbook.io.WorksheetStyle(
@@ -315,24 +328,88 @@ def export_annotations_to_excel():
     style['Annotations'] = wc_utils.workbook.io.WorksheetStyle(
         head_rows=1, head_columns=1,
         head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    style['Namespaces'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1,
+        head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
 
     ws_models.append(wc_utils.workbook.core.Row([
         'ID', 'Label', 'Name', 'Type',
         'Compartments', 'Species', 'Rules', 'Reactions', 'Global parameters', 'Reaction parameters',
+        'Superkingdom', 'Kingdom', 'Phylum', 'Species',
         'Is curated', 'Number annotations']))
-    ws_model_annotations.append(wc_utils.workbook.core.Row(['Model', 'Relationship', 'Namespace', 'ID']))
+    ws_model_annotations.append(wc_utils.workbook.core.Row(['Model', 'Relationship', 'Namespace', 'ID', 'Description']))
     ws_annotations.append(wc_utils.workbook.core.Row(['Relationship', 'Namespace', 'Frequency']))
+    ws_namespaces.append(wc_utils.workbook.core.Row(['Namespace', 'Frequency']))
 
-    for model in session.query(Model).order_by(Model.id).all():
+    bio_portal = kinetic_datanator.data_source.bio_portal.BioPortal()
+    bio_portal_ontologies = bio_portal.get_ontologies()
+    del(bio_portal_ontologies['MAMO'])  # remove MAMO becuse OWL can't be parsed by pronto
+    kegg = bioservices.kegg.KEGG()
+    reactome = bioservices.reactome.Reactome()
+    loaded_ontologies = {}
+    ncbi_taxa = ete3.NCBITaxa()
+    n_model = session.query(Model).count()
+    print('Annotating models ...')
+    for i_model, model in enumerate(session.query(Model).order_by(Model.id).all()):
+        if i_model % 100 == 0:
+            print('  Annotating model {} of {}'.format(i_model + 1, n_model))
+        species_name = None
+        phylum_name = None
+        kingdom_name = None
+        superkingdom_name = None
+        taxon_id = next((int(float(a.id)) for a in model.annotations if a.namespace == 'taxonomy'), None)
+        if taxon_id:
+            for taxon_id, rank in ncbi_taxa.get_rank(ncbi_taxa.get_lineage(taxon_id)).items():
+                if rank == 'species':
+                    species_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+                if rank == 'phylum':
+                    phylum_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+                if rank == 'kingdom':
+                    kingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+                if rank == 'superkingdom':
+                    superkingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+
         ws_models.append(wc_utils.workbook.core.Row([
             model.id, model.label, model.name, model.type,
             model.compartments or None, model.species or None, model.rules or None, model.reactions or None,
             model.global_parameters or None, model.reaction_parameters or None,
+            superkingdom_name, kingdom_name, phylum_name, species_name,
             model.curated, len(model.annotations)
         ]))
         for annotation in sorted(model.annotations, key=lambda ann: (ann.relationship, ann.namespace, ann.id)):
+
+            onto_id = annotation.namespace.upper()
+            if onto_id.startswith('OBO.'):
+                onto_id = onto_id[4:]
+            term_id = annotation.id
+            if onto_id in bio_portal_ontologies and term_id.startswith(onto_id + ':'):
+                if onto_id not in loaded_ontologies:
+                    loaded_ontologies[onto_id] = bio_portal.get_ontology(onto_id)
+                onto = loaded_ontologies[onto_id]
+                if term_id in onto:
+                    description = onto[term_id].name
+                else:
+                    description = None
+            elif annotation.namespace == 'kegg.pathway':
+                md = kegg.parse(kegg.get(annotation.id))
+                if isinstance(md, dict):
+                    description = md['NAME'][0]
+                else:
+                    description = None
+            elif annotation.namespace == 'reactome':
+                md = reactome.query_by_id('Pathway', annotation.id)
+                if 'displayName' in md:
+                    description = md['displayName']
+                else:
+                    description = None
+            elif annotation.namespace == 'taxonomy':
+                description = ncbi_taxa.translate_to_names([int(float(annotation.id))])[0]
+            else:
+                description = None
+
             ws_model_annotations.append(wc_utils.workbook.core.Row(
-                [model.id, annotation.relationship, annotation.namespace, annotation.id]))
+                [model.id, annotation.relationship, annotation.namespace, annotation.id, description]))
+    print('  done')
 
     q = session \
         .query(Annotation.relationship, Annotation.namespace, sqlalchemy.func.count(Model._id)) \
@@ -342,12 +419,25 @@ def export_annotations_to_excel():
     for relationship, namespace, count in q.all():
         ws_annotations.append(wc_utils.workbook.core.Row([relationship, namespace, count]))
 
+    q = session \
+        .query(Annotation.namespace, sqlalchemy.func.count(Model._id)) \
+        .join(Model, Annotation.models) \
+        .group_by(Annotation.namespace) \
+        .order_by(sqlalchemy.func.count(Model._id).desc())
+    for namespace, count in q.all():
+        ws_namespaces.append(wc_utils.workbook.core.Row([namespace, count]))
+
     wc_utils.workbook.io.ExcelWriter(ANNOTATIONS_EXCEL_FILENAME).run(wb, style=style)
 
 
 def summarize_models():
     wb = wc_utils.workbook.core.Workbook()
     style = wc_utils.workbook.io.WorkbookStyle()
+
+    ws = wb['Pathways'] = wc_utils.workbook.core.Worksheet()
+    style['Pathways'] = wc_utils.workbook.io.WorksheetStyle(
+        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
+    summarize_models_by_pathway(ws)
 
     ws_species = wb['Species'] = wc_utils.workbook.core.Worksheet()
     ws_phyla = wb['Phyla'] = wc_utils.workbook.core.Worksheet()
@@ -357,11 +447,6 @@ def summarize_models():
         head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
     summarize_models_by_taxonomy(ws_species, ws_phyla)
 
-    ws = wb['Pathways'] = wc_utils.workbook.core.Worksheet()
-    style['Pathways'] = wc_utils.workbook.io.WorksheetStyle(
-        head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
-    summarize_models_by_pathway(ws)
-
     ws = wb['Mathematical types'] = wc_utils.workbook.core.Worksheet()
     style['Mathematical types'] = wc_utils.workbook.io.WorksheetStyle(
         head_rows=1, head_columns=1, head_row_font_bold=True, head_row_fill_fgcolor='CCCCCC', row_height=15)
@@ -370,68 +455,93 @@ def summarize_models():
     wc_utils.workbook.io.ExcelWriter(SUMMARY_EXCEL_FILENAME).run(wb, style=style)
 
 
-def summarize_models_by_taxonomy(ws_species, ws_phyla):
-    """
-    Args:
-        wc_utils.workbook.core.Worksheet
-    """
-    session = get_database_session()
-    q = session.query(Annotation.id, Model.curated, sqlalchemy.func.count(Model._id)) \
-        .join(Model, Annotation.models) \
-        .filter(Annotation.namespace == 'taxonomy') \
-        .group_by(Annotation.id, Model.curated)
-
-    ncbi_taxa = ete3.NCBITaxa()
-
-    species = {}
-    phyla = {}
-    for model_taxon_id, model_curated, count in q.all():
-        model_taxon_id = int(float(model_taxon_id))
-        species_name = None
-        phylum_name = None
-        for taxon_id, rank in ncbi_taxa.get_rank(ncbi_taxa.get_lineage(model_taxon_id)).items():
-            if rank == 'species':
-                species_name = ncbi_taxa.translate_to_names([taxon_id])[0]
-            if rank == 'phylum':
-                phylum_name = ncbi_taxa.translate_to_names([taxon_id])[0]
-            if rank == 'superkingdom':
-                superkingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
-
-        if (superkingdom_name, phylum_name, species_name) not in species:
-            species[(superkingdom_name, phylum_name, species_name)] = {True: 0, False: 0}
-        species[(superkingdom_name, phylum_name, species_name)][model_curated] += count
-
-        if (superkingdom_name, phylum_name) not in phyla:
-            phyla[(superkingdom_name, phylum_name)] = {True: 0, False: 0}
-        phyla[(superkingdom_name, phylum_name)][model_curated] += count
-
-    for (superkingdom_name, phylum_name, species_name), counts in species.items():
-        ws_species.append(wc_utils.workbook.core.Row([
-            species_name or 'Unknown',
-            phylum_name,
-            superkingdom_name,
-            counts[True] or None,
-            counts[False] or None]))
-    ws_species.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
-    ws_species.insert(0, wc_utils.workbook.core.Row(['Species', 'Phylum', 'Superkingdom', 'Curated', 'Non-curated']))
-
-    for (superkingdom_name, phylum_name), counts in phyla.items():
-        ws_phyla.append(wc_utils.workbook.core.Row([
-            superkingdom_name,
-            phylum_name or 'Unknown',
-            counts[True] or None,
-            counts[False] or None]))
-    ws_phyla.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
-    ws_phyla.insert(0, wc_utils.workbook.core.Row(['Superkingdom', 'Phylum', 'Curated', 'Non-curated']))
-
-
 def summarize_models_by_pathway(ws):
     """
     Args:
         wc_utils.workbook.core.Worksheet
     """
     session = get_database_session()
-    pass
+    #bio_portal = kinetic_datanator.data_source.bio_portal.BioPortal()
+    #onto = bio_portal.get_ontology('EFO')
+    #self.assertEqual(onto['SBO:0000001'].name, 'rate law')
+
+
+def summarize_models_by_taxonomy(ws_species, ws_phyla):
+    """
+    Args:
+        wc_utils.workbook.core.Worksheet
+    """
+    session = get_database_session()
+    q_annotated = session \
+        .query(Annotation.id, Model.curated, sqlalchemy.func.count(Model._id)) \
+        .join(Model, Annotation.models) \
+        .filter(Annotation.namespace == 'taxonomy') \
+        .group_by(Annotation.id, Model.curated)
+
+    annotated_model_ids = [m[0] for m in session
+                           .query(Model._id)
+                           .join(Annotation, Model.annotations)
+                           .filter(Annotation.namespace == 'taxonomy')
+                           .group_by(Model._id)
+                           .all()]
+    q_unannotated = session \
+        .query(Model.curated, sqlalchemy.func.count(Model._id)) \
+        .filter(~Model._id.in_(annotated_model_ids)) \
+        .group_by(Model.curated)
+    count_unannotated = {}
+    for curated, count in q_unannotated.all():
+        count_unannotated[curated] = count
+
+    ncbi_taxa = ete3.NCBITaxa()
+
+    species = {}
+    phyla = {}
+    for model_taxon_id, model_curated, count in q_annotated.all():
+        model_taxon_id = int(float(model_taxon_id))
+        species_name = None
+        phylum_name = None
+        kingdom_name = None
+        superkingdom_name = None
+        for taxon_id, rank in ncbi_taxa.get_rank(ncbi_taxa.get_lineage(model_taxon_id)).items():
+            if rank == 'species':
+                species_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+            if rank == 'phylum':
+                phylum_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+            if rank == 'kingdom':
+                kingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+            if rank == 'superkingdom':
+                superkingdom_name = ncbi_taxa.translate_to_names([taxon_id])[0]
+
+        if (superkingdom_name, kingdom_name, phylum_name, species_name) not in species:
+            species[(superkingdom_name, kingdom_name, phylum_name, species_name)] = {True: 0, False: 0}
+        species[(superkingdom_name, kingdom_name, phylum_name, species_name)][model_curated] += count
+
+        if (superkingdom_name, kingdom_name, phylum_name) not in phyla:
+            phyla[(superkingdom_name, kingdom_name, phylum_name)] = {True: 0, False: 0}
+        phyla[(superkingdom_name, kingdom_name, phylum_name)][model_curated] += count
+
+    for (superkingdom_name, kingdom_name, phylum_name, species_name), counts in species.items():
+        ws_species.append(wc_utils.workbook.core.Row([
+            species_name or '<Annotated rank above species>',
+            phylum_name,
+            kingdom_name,
+            superkingdom_name,
+            counts[True] or None,
+            counts[False] or None]))
+    ws_species.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
+    ws_species.insert(0, wc_utils.workbook.core.Row(['Not annotated', None, None, count_unannotated[True], count_unannotated[False]]))
+    ws_species.insert(0, wc_utils.workbook.core.Row(['Species', 'Phylum', 'Kingdom', 'Superkingdom', 'Curated', 'Non-curated']))
+
+    for (superkingdom_name, kingdom_name, phylum_name), counts in phyla.items():
+        ws_phyla.append(wc_utils.workbook.core.Row([
+            superkingdom_name,
+            kingdom_name,
+            phylum_name or '<Annotated rank above phylum>',
+            counts[True] or None,
+            counts[False] or None]))
+    ws_phyla.sort(key=lambda row: (row[-2] or 0) + (row[-1] or 0), reverse=True)
+    ws_phyla.insert(0, wc_utils.workbook.core.Row(['Not annotated', None, count_unannotated[True], count_unannotated[False]]))
+    ws_phyla.insert(0, wc_utils.workbook.core.Row(['Superkingdom', 'Kingdom', 'Phylum', 'Curated', 'Non-curated']))
 
 
 def summarize_models_by_mathematical_type(ws):
@@ -501,5 +611,5 @@ if __name__ == "__main__":
     download_biomodels()
     setup_database()
     load_database()
-    # export_annotations_to_excel()
+    export_annotations_to_excel()
     summarize_models()
