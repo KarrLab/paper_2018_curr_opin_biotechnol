@@ -3,4 +3,4 @@ ete3
 git+https://github.com/KarrLab/kinetic_datanator.git#egg=kinetic_datanator
 python-libsbml
 sqlalchemy
-git+https://github.com/KarrLab/wc_utils.git#egg=wc_utils
+git+https://github.com/KarrLab/wc_utils.git#egg=wc_utils-0.0.1a5
