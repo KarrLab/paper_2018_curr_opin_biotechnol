@@ -9,7 +9,7 @@
 import bioservices
 import ete3
 import glob
-import kinetic_datanator.data_source.bio_portal
+import datanator.data_source.bio_portal
 import libsbml
 import os
 import sqlalchemy
@@ -341,7 +341,7 @@ def export_annotations_to_excel():
     ws_annotations.append(wc_utils.workbook.core.Row(['Relationship', 'Namespace', 'Frequency']))
     ws_namespaces.append(wc_utils.workbook.core.Row(['Namespace', 'Frequency']))
 
-    bio_portal = kinetic_datanator.data_source.bio_portal.BioPortal()
+    bio_portal = datanator.data_source.bio_portal.BioPortal()
     bio_portal_ontologies = bio_portal.get_ontologies()
     del(bio_portal_ontologies['MAMO'])  # remove MAMO becuse OWL can't be parsed by pronto
     kegg = bioservices.kegg.KEGG()
@@ -461,7 +461,7 @@ def summarize_models_by_pathway(ws):
         wc_utils.workbook.core.Worksheet
     """
     session = get_database_session()
-    #bio_portal = kinetic_datanator.data_source.bio_portal.BioPortal()
+    #bio_portal = datanator.data_source.bio_portal.BioPortal()
     #onto = bio_portal.get_ontology('EFO')
     #self.assertEqual(onto['SBO:0000001'].name, 'rate law')
 
